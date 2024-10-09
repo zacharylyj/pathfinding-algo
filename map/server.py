@@ -1,101 +1,167 @@
 import socket
 import threading
 import pickle
-import noise  # For generating Perlin noise
 import numpy as np
+from scipy.ndimage import label
+from noise import pnoise2
+import random
 
-# Define labyrinth dimensions
-LABYRINTH_WIDTH = 20
-LABYRINTH_HEIGHT = 20
+# Define the states for each cell
+NO_WALL = 0
+HORIZONTAL_WALL = 1
+VERTICAL_WALL = 2
+SLASH_FORWARD_WALL = 3
+SLASH_BACKWARD_WALL = 4
 
-# Player positions and labyrinth stored on the server
-player_positions = {}
-labyrinth = None  # Will be generated and sent to clients
+# Maze dimensions
+width, height = 1000, 1000
 
+# Define region types
+NORMAL = 0
+DENSE = 1
+WIDE = 2
+LONG = 3
+OPEN = 4
+EXTRA_WIDE = 5
 
-# Function to generate a labyrinth using Perlin noise
-def generate_labyrinth(width, height):
-    scale = 10.0  # Controls the scale of the noise
-    labyrinth = np.zeros((width, height))
+# Parameters for Perlin noise
+octaves = 5
+scale = 10.0
+persistence = 0.5
+lacunarity = 2.0
 
+# Generate Perlin noise map
+perlin_noise_map = np.zeros((height, width))
+for y in range(height):
     for x in range(width):
-        for y in range(height):
-            # Generate noise value between -1 and 1
-            noise_value = noise.pnoise2(x / scale, y / scale, octaves=2)
-            # Convert noise value to either wall (1) or path (0)
-            if noise_value > 0:  # Threshold to decide wall or path
-                labyrinth[x, y] = 1  # Wall
-            else:
-                labyrinth[x, y] = 0  # Path
-    return labyrinth
+        perlin_noise_map[y][x] = pnoise2(
+            x / scale,
+            y / scale,
+            octaves=octaves,
+            persistence=persistence,
+            lacunarity=lacunarity,
+            repeatx=width,
+            repeaty=height,
+            base=42,
+        )
+
+# Normalize Perlin noise to range between 0 and 1
+perlin_noise_map = (perlin_noise_map - perlin_noise_map.min()) / (
+    perlin_noise_map.max() - perlin_noise_map.min()
+)
+
+# Assign regions based on Perlin noise values
+noise_map = np.full((height, width), NORMAL)  # Default all to NORMAL
+
+# Label connected clusters in the Perlin noise map
+clusters, num_clusters = label(perlin_noise_map < 0.5)
+
+# Randomly assign a region type to each cluster
+for cluster_num in range(1, num_clusters + 1):
+    region_type = np.random.choice([DENSE, WIDE, LONG, OPEN, EXTRA_WIDE])
+    noise_map[clusters == cluster_num] = region_type
 
 
-# Function to broadcast updated positions and labyrinth to all clients
-def broadcast_state(clients):
-    for client in clients:
-        try:
-            # Send player positions and labyrinth state
-            data = pickle.dumps((player_positions, labyrinth))
-            client.sendall(data)
-        except:
-            clients.remove(client)
+# Function to generate walls based on the region type
+def generate_walls_for_region(region_type):
+    if region_type == NORMAL:
+        return np.random.choice(
+            [
+                NO_WALL,
+                HORIZONTAL_WALL,
+                VERTICAL_WALL,
+                SLASH_FORWARD_WALL,
+                SLASH_BACKWARD_WALL,
+            ],
+            p=[0.2, 0.2, 0.2, 0.2, 0.2],
+        )
+    elif region_type == DENSE:
+        return np.random.choice(
+            [HORIZONTAL_WALL, VERTICAL_WALL, SLASH_FORWARD_WALL, SLASH_BACKWARD_WALL],
+            p=[0.25, 0.25, 0.25, 0.25],
+        )
+    elif region_type == WIDE:
+        return np.random.choice(
+            [NO_WALL, HORIZONTAL_WALL, VERTICAL_WALL], p=[0.5, 0.25, 0.25]
+        )
+    elif region_type == LONG:
+        return np.random.choice([NO_WALL, HORIZONTAL_WALL], p=[0.1, 0.9])
+    elif region_type == OPEN:
+        return NO_WALL
+    elif region_type == EXTRA_WIDE:
+        return np.random.choice(
+            [NO_WALL, HORIZONTAL_WALL, VERTICAL_WALL], p=[0.7, 0.15, 0.15]
+        )
 
 
-# Function to handle communication with a single client
-def handle_client(client_socket, clients):
-    global player_positions
+# Generate the maze using the noise map to define wall types
+maze = np.zeros((height, width), dtype=int)
+for y in range(height):
+    for x in range(width):
+        maze[y, x] = generate_walls_for_region(noise_map[y, x])
+
+
+# Function to find a valid starting position in the maze (a cell with NO_WALL)
+def find_valid_start_position(maze):
+    height, width = maze.shape
+    while True:
+        x = random.randint(0, width - 1)
+        y = random.randint(0, height - 1)
+        if maze[y, x] == NO_WALL:  # Check if this is a walkable area
+            return (x, y)
+
+
+# Function to extract a section of the maze around the player
+def get_maze_chunk(maze, center_x, center_y, chunk_size=50):
+    half_chunk = chunk_size // 2
+    min_x = max(center_x - half_chunk, 0)
+    max_x = min(center_x + half_chunk, width)
+    min_y = max(center_y - half_chunk, 0)
+    max_y = min(center_y + half_chunk, height)
+
+    return maze[min_y:max_y, min_x:max_x]
+
+
+# Server to handle communication and send map chunks
+def handle_client(client_socket):
     try:
-        # Receive player ID from the client upon connection
-        data = client_socket.recv(1024)
-        player_id = pickle.loads(data)
-        print(f"Player {player_id} connected.")
-        player_positions[player_id] = (1, 1)  # Initialize player at position (1,1)
-
-        # Send initial state (positions and labyrinth) to the client
-        broadcast_state(clients)
+        # Send the player their initial valid spawn point
+        player_position = find_valid_start_position(maze)
+        client_socket.sendall(pickle.dumps(player_position))
 
         while True:
-            # Receive updated position from the client
+            # Receive player's current position from client
             data = client_socket.recv(1024)
             if not data:
                 break
-            position_update = pickle.loads(data)
-            player_positions.update(position_update)
+            player_position = pickle.loads(data)
 
-            # Broadcast updated positions to all clients
-            broadcast_state(clients)
-
+            # Send the relevant chunk of the maze based on the player's current position
+            maze_chunk = get_maze_chunk(maze, player_position[0], player_position[1])
+            client_socket.sendall(pickle.dumps(maze_chunk))
     except Exception as e:
         print(f"Error: {e}")
     finally:
         client_socket.close()
-        # Remove player from position list when they disconnect
-        if player_id in player_positions:
-            del player_positions[player_id]
-        broadcast_state(clients)
 
 
-# Server to handle multiple clients and generate the labyrinth
+# Server setup
 def server():
-    global labyrinth
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("localhost", 5555))
     server_socket.listen(5)
-
-    # Generate labyrinth once when the server starts
-    labyrinth = generate_labyrinth(LABYRINTH_WIDTH, LABYRINTH_HEIGHT)
-    print("Labyrinth generated.")
-
     print("Server started, waiting for connections...")
 
-    clients = []
-    while True:
-        client_socket, addr = server_socket.accept()
-        print(f"Connection from {addr}")
-        clients.append(client_socket)
-
-        # Start a new thread to handle the client
-        threading.Thread(target=handle_client, args=(client_socket, clients)).start()
+    try:
+        while True:
+            client_socket, addr = server_socket.accept()
+            print(f"Connection from {addr}")
+            threading.Thread(target=handle_client, args=(client_socket,)).start()
+    except KeyboardInterrupt:
+        print("Server is shutting down...")
+    finally:
+        server_socket.close()
 
 
 if __name__ == "__main__":
